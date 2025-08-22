@@ -1,47 +1,17 @@
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AllowListBucketForUser",
-      "Effect": "Allow",
-      "Principal": { "AWS": "arn:aws:iam::123456789012:user/NOME_DO_USER" },
-      "Action": [
-        "s3:ListBucket",
-        "s3:GetBucketLocation"
-      ],
-      "Resource": "arn:aws:s3:::bucket-um"
-    },
-    {
-      "Sid": "AllowPutObjectOnlyForUser",
-      "Effect": "Allow",
-      "Principal": { "AWS": "arn:aws:iam::123456789012:user/NOME_DO_USER" },
-      "Action": [
-        "s3:PutObject",
-        "s3:AbortMultipartUpload",
-        "s3:ListMultipartUploadParts"
-      ],
-      "Resource": "arn:aws:s3:::bucket-um/*"
-    },
-    {
-      "Sid": "DenyGetObjectForUser",
-      "Effect": "Deny",
-      "Principal": { "AWS": "arn:aws:iam::123456789012:user/NOME_DO_USER" },
-      "Action": [
-        "s3:GetObject",
-        "s3:GetObjectVersion"
-      ],
-      "Resource": "arn:aws:s3:::bucket-um/*"
-    },
-    {
-      "Sid": "DenyInsecureTransportAll",
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": "s3:*",
-      "Resource": [
-        "arn:aws:s3:::bucket-um",
-        "arn:aws:s3:::bucket-um/*"
-      ],
-      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
-    }
-  ]
-}
+BUCKET="meu-bucket"
+PREFIX="minha/pasta/"       # a “pasta” dentro do bucket
+START="2025-08-21T00:00:00+00:00"  # início (UTC)
+END="2025-08-22T00:00:00+00:00"    # fim (UTC)
+DEST="./downloads"
+
+mkdir -p "$DEST"
+
+aws s3api list-objects-v2 \
+  --bucket "$BUCKET" \
+  --prefix "$PREFIX" \
+  --page-size 1000 \
+  --query "Contents[?LastModified>='$START' && LastModified<'$END'].Key" \
+  --output text |
+tr '\t' '\n' | sed '/^$/d' | while read -r key; do
+  aws s3 cp "s3://$BUCKET/$key" "$DEST/"
+done
