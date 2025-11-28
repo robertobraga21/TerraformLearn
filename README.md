@@ -9,7 +9,7 @@ def buscar_irsa_cluster():
     except Exception as e:
         print(f"Erro ao carregar configuração do Kubernetes: {e}")
         return
-
+        
     v1 = client.CoreV1Api()
 
     # 2. LISTA DE EXCLUSÃO (Edite aqui)
