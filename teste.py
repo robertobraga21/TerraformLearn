@@ -1,166 +1,457 @@
-import boto3
-import json
+import subprocess
+import time
 import sys
-from kubernetes import client, config
-from botocore.exceptions import ProfileNotFound, NoCredentialsError, ClientError
+import json
+import boto3
+import re
+from botocore.exceptions import ClientError
+from kubernetes import client, config as k8s_config
 
-# --- CONFIGURAÇÃO ESTÁTICA (Filtros de Namespace) ---
-NAMESPACES_IGNORADOS = [
-    "kube-system", 
-    "kube-public", 
-    "kube-node-lease", 
-    "monitoring", 
-    "logging", 
-    "amazon-cloudwatch"
+# --- CONFIGURAÇÃO GLOBAL ---
+CONFIG = {}
+
+SYSTEM_NAMESPACES = [
+    "default", "kube-system", "kube-public", "kube-node-lease", 
+    "velero", "amazon-cloudwatch", "aws-observability", "istio-system", "istio-ingress", "cert-manager", "monitoring"
 ]
 
-def obter_inputs_usuario():
-    print(f"{'='*60}")
-    print(f"{' MIGRATION WIZARD: IRSA TRUST RELATIONSHIP ':.^60}")
-    print(f"{'='*60}")
-    
-    # 1. Profile
-    profile = input("\n[1] Digite o nome do seu AWS PROFILE (conforme ~/.aws/credentials): ").strip()
-    if not profile:
-        print("❌ O nome do perfil é obrigatório.")
-        sys.exit(1)
+EXCLUDE_RESOURCES = "pods,replicasets,endpoints,endpointslices"
 
-    # 2. Região
-    region = input("[2] Digite a Região AWS (Padrão: us-east-1): ").strip()
-    if not region:
-        region = "us-east-1"
-
-    # 3. OIDC
-    print("\n[3] Cole o OIDC Provider do NOVO cluster (sem 'https://')")
-    print("    Ex: oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D0...")
-    novo_oidc = input("    > ").strip()
-    # Remove https:// se o usuário colar por acidente
-    novo_oidc = novo_oidc.replace("https://", "")
-    
-    if not novo_oidc:
-        print("❌ O OIDC é obrigatório.")
-        sys.exit(1)
-
-    # 4. Modo de Execução
-    print("\n[4] Modo de Execução:")
-    print("    (S) Simulação / Dry-Run (Apenas lista o que faria)")
-    print("    (E) Executar / Apply (Aplica as mudanças na AWS)")
-    modo = input("    Escolha [S/E]: ").strip().upper()
-    
-    dry_run = True
-    if modo == 'E':
-        confirmacao = input("    ⚠️  TEM CERTEZA? Isso alterará as Roles na AWS. Digite 'SIM' para confirmar: ")
-        if confirmacao == 'SIM':
-            dry_run = False
-        else:
-            print("    Cancelado pelo usuário. Voltando para modo Simulação.")
-    
-    return profile, region, novo_oidc, dry_run
-
-def atualizar_trust_policy(iam_client, role_name, namespace, service_account, account_id, novo_oidc, dry_run):
-    try:
-        role = iam_client.get_role(RoleName=role_name)
-        policy_doc = role['Role']['AssumeRolePolicyDocument']
-        
-        # Verifica duplicidade
-        str_policy = json.dumps(policy_doc)
-        if novo_oidc in str_policy:
-            print(f"  [SKIP] Role '{role_name}' já possui este OIDC.")
-            return
-
-        print(f"  [UPDATE] Adicionando novo OIDC na Role: {role_name}")
-
-        novo_statement = {
+VELERO_IAM_POLICY = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
             "Effect": "Allow",
-            "Principal": {
-                "Federated": f"arn:aws:iam::{account_id}:oidc-provider/{novo_oidc}"
-            },
-            "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {
-                "StringEquals": {
-                    f"{novo_oidc}:sub": f"system:serviceaccount:{namespace}:{service_account}",
-                    f"{novo_oidc}:aud": "sts.amazonaws.com"
-                }
-            }
+            "Action": [
+                "ec2:DescribeVolumes", "ec2:DescribeSnapshots", "ec2:CreateTags",
+                "ec2:CreateVolume", "ec2:CreateSnapshot", "ec2:DeleteSnapshot"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject", "s3:DeleteObject", "s3:PutObject",
+                "s3:AbortMultipartUpload", "s3:ListBucket"
+            ],
+            "Resource": "*" 
         }
+    ]
+}
 
-        policy_doc['Statement'].append(novo_statement)
-
-        if not dry_run:
-            iam_client.update_assume_role_policy(
-                RoleName=role_name,
-                PolicyDocument=json.dumps(policy_doc)
-            )
-            print(f"  [SUCESSO] Policy atualizada na AWS!")
-        else:
-            print(f"  [DRY-RUN] Simulação: Statement preparado, mas não enviado.")
-
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'NoSuchEntity':
-            print(f"  [ERRO] A Role '{role_name}' não foi encontrada na conta {account_id}.")
-        else:
-            print(f"  [ERRO] Falha AWS: {e}")
-    except Exception as e:
-        print(f"  [ERRO] Genérico: {e}")
-
-def main():
-    # Coleta dados via input
-    aws_profile, aws_region, novo_oidc, dry_run = obter_inputs_usuario()
-
-    # Configura Sessão AWS
-    try:
-        print(f"\n🔄 Conectando na AWS (Profile: {aws_profile} | Region: {aws_region})...")
-        session = boto3.Session(profile_name=aws_profile, region_name=aws_region)
-        iam = session.client('iam')
-        sts = session.client('sts')
-        
-        identity = sts.get_caller_identity()
-        account_id = identity.get('Account')
-        print(f"✅ Conectado! Conta AWS: {account_id}")
-        
-    except ProfileNotFound:
-        print(f"❌ Erro: O perfil '{aws_profile}' não foi encontrado no seu ~/.aws/config ou credentials.")
-        return
-    except NoCredentialsError:
-        print("❌ Erro: Nenhuma credencial encontrada.")
-        return
-    except Exception as e:
-        print(f"❌ Erro ao conectar na AWS: {e}")
-        return
-
-    # Configura Kubernetes
-    print("\n🔄 Lendo contexto do Kubernetes...")
-    try:
-        config.load_kube_config()
-        v1 = client.CoreV1Api()
-        current_context = config.list_kube_config_contexts()[1]['name'] # Pega contexto atual
-        print(f"✅ K8s conectado! Contexto atual: {current_context}")
-    except Exception as e:
-        print(f"❌ Erro ao conectar no Kubernetes: {e}")
-        return
-
-    print(f"\n{' INICIANDO VARREDURA ':=^60}")
-    
-    todos_namespaces = v1.list_namespace()
-
-    for ns in todos_namespaces.items:
-        ns_nome = ns.metadata.name
-        if ns_nome in NAMESPACES_IGNORADOS:
+# --- 0. HELPERS ---
+def get_smart_input(prompt_text, default=None, options=None, regex=None):
+    while True:
+        value = input(prompt_text).strip()
+        if not value:
+            if default is not None: return default
+            print("   ❌ Este campo é obrigatório.")
             continue
+        if options:
+            if value.lower() not in [str(o).lower() for o in options]:
+                if len(options) > 10: print(f"   ❌ Opção inválida.")
+                else: print(f"   ❌ Opção inválida. Escolha entre: {options}")
+                continue
+            return value
+        if regex and not re.match(regex, value):
+            print(f"   ❌ Formato inválido.")
+            continue
+        return value
 
-        service_accounts = v1.list_namespaced_service_account(ns_nome)
-        for sa in service_accounts.items:
-            annotations = sa.metadata.annotations
-            
-            if annotations and 'eks.amazonaws.com/role-arn' in annotations:
-                role_arn = annotations['eks.amazonaws.com/role-arn']
-                role_name = role_arn.split("/")[-1]
-                sa_name = sa.metadata.name
-                
-                print(f"\n🔍 Encontrado: NS={ns_nome} | SA={sa_name}")
-                atualizar_trust_policy(iam, role_name, ns_nome, sa_name, account_id, novo_oidc, dry_run)
+def run_shell(cmd, ignore_error=False, quiet=False):
+    try: 
+        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL if quiet else None)
+        return True
+    except: 
+        if not ignore_error: print(f"❌ Erro comando: {cmd}"); sys.exit(1)
+        return False
 
-    print(f"\n{' FIM DA EXECUÇÃO ':=^60}")
+# --- 1. SETUP INICIAL (PROFILE ENFORCED) ---
+def get_inputs_initial():
+    print("\n🚀 --- Migração Cluster EKS  ---")
+    
+    CONFIG['env'] = get_smart_input("   Ambiente (DEV, HML, PRD): ", options=['DEV', 'HML', 'PRD']).upper()
+    
+    print("\n🔑 --- Autenticação AWS (Profile Obrigatório) ---")
+    
+    # Lista profiles disponíveis na máquina
+    available_profiles = boto3.Session().available_profiles
+    
+    if not available_profiles:
+        print("   ⛔ ERRO: Nenhum profile AWS encontrado em ~/.aws/credentials ou ~/.aws/config.")
+        print("   Configure suas credenciais (aws configure) antes de rodar este script.")
+        sys.exit(1)
+        
+    print(f"   Profiles detectados: {', '.join(available_profiles)}")
+    
+    # Validação estrita: O usuário DEVE digitar um profile que existe
+    while True:
+        p_input = get_smart_input("   Digite o nome do Profile: ")
+        if p_input in available_profiles:
+            CONFIG['aws_profile'] = p_input
+            break
+        print(f"   ❌ O profile '{p_input}' não existe. Tente novamente.")
+
+    # Cria sessão temporária com o profile escolhido para detectar região default
+    try:
+        temp_session = boto3.Session(profile_name=CONFIG['aws_profile'])
+        detected_region = temp_session.region_name if temp_session.region_name else "us-east-1"
+    except:
+        detected_region = "us-east-1"
+
+    try: valid_regions = boto3.Session().get_available_regions('eks')
+    except: valid_regions = ['us-east-1', 'us-east-2', 'sa-east-1']
+
+    CONFIG['region'] = get_smart_input(
+        f"   Região AWS [{detected_region}]: ", 
+        default=detected_region, 
+        options=valid_regions
+    )
+    
+    CONFIG['cleanup'] = False
+    if get_smart_input("\n🧹 Limpar instalação anterior (Reset)? (s/n) [n]: ", default='n', options=['s', 'n']).lower() == 's':
+        CONFIG['cleanup'] = True
+
+def get_aws_session():
+    # Sempre usa o profile definido
+    return boto3.Session(profile_name=CONFIG['aws_profile'], region_name=CONFIG['region'])
+
+# --- 2. SELEÇÃO DE CLUSTER ---
+def select_cluster(prompt_msg):
+    eks = get_aws_session().client('eks')
+    print(f"   🔍 Listando clusters na região {CONFIG['region']}...")
+    try:
+        clusters = eks.list_clusters()['clusters']
+    except Exception as e:
+        print(f"      ⛔ Erro ao listar clusters: {e}"); sys.exit(1)
+
+    if not clusters:
+        print("      ❌ Nenhum cluster encontrado nesta região.")
+        sys.exit(1)
+
+    print(prompt_msg)
+    for idx, name in enumerate(clusters):
+        print(f"      [{idx}] {name}")
+    
+    while True:
+        sel = get_smart_input("      Selecione o número: ")
+        if sel.isdigit() and 0 <= int(sel) < len(clusters):
+            cluster_name = clusters[int(sel)]
+            try:
+                arn = eks.describe_cluster(name=cluster_name)['cluster']['arn']
+                print(f"      ✅ Selecionado: {cluster_name}")
+                context = resolve_kube_context_logic(cluster_name, arn)
+                return cluster_name, context
+            except Exception as e:
+                print(f"      ❌ Erro ao validar cluster escolhido: {e}")
+                sys.exit(1)
+        print(f"      ❌ Inválido. Digite um número entre 0 e {len(clusters)-1}.")
+
+def resolve_kube_context_logic(cluster_name, cluster_arn):
+    try:
+        ctxs, _ = k8s_config.list_kube_config_contexts()
+        if ctxs:
+            for c in ctxs:
+                if c['name'] == cluster_arn or c['name'] == cluster_name:
+                    return c['name']
+    except: pass
+    
+    print(f"      ℹ️  Gerando contexto local para {cluster_name}...")
+    # Força o uso do profile no comando AWS CLI
+    cmd = f"aws eks update-kubeconfig --name {cluster_name} --region {CONFIG['region']} --profile {CONFIG['aws_profile']}"
+    run_shell(cmd, quiet=True)
+    return cluster_arn
+
+# --- 3. RECURSOS AWS ---
+def create_bucket():
+    s3 = get_aws_session().client('s3'); sts = get_aws_session().client('sts')
+    acc = sts.get_caller_identity()["Account"]
+    default_name = f"velero-backup-{CONFIG['env'].lower()}-{acc}"
+    print(f"\n⚠️  Nenhum bucket encontrado.")
+    while True:
+        print(f"   Sugestão: {default_name}")
+        bucket_name = get_smart_input("   Nome desejado (Enter para sugestão): ", default=default_name)
+        try:
+            s3.head_bucket(Bucket=bucket_name)
+            print(f"   ❌ '{bucket_name}' JÁ EXISTE! Tente outro.")
+        except ClientError as e:
+            if int(e.response['Error']['Code']) == 404: break 
+            elif int(e.response['Error']['Code']) == 403: print(f"   ❌ Sem permissão.")
+            else: print(f"   ❌ Erro: {e}")
+    try:
+        print(f"   🔨 Criando bucket...")
+        if CONFIG['region'] == 'us-east-1': s3.create_bucket(Bucket=bucket_name)
+        else: s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={'LocationConstraint': CONFIG['region']})
+        return bucket_name
+    except Exception as e: print(f"❌ Erro: {e}"); sys.exit(1)
+
+def create_role():
+    iam = get_aws_session().client('iam'); sts = get_aws_session().client('sts')
+    acc = sts.get_caller_identity()["Account"]
+    default_name = f"velero-role-{CONFIG['env'].lower()}-auto"
+    print(f"\n⚠️  Nenhuma role encontrada.")
+    while True:
+        print(f"   Sugestão: {default_name}")
+        role_name = get_smart_input("   Nome desejado (Enter para sugestão): ", default=default_name)
+        try:
+            iam.get_role(RoleName=role_name)
+            print(f"   ❌ Role '{role_name}' JÁ EXISTE! Tente outro.")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchEntity': break
+            else: print(f"   ❌ Erro: {e}")
+    try:
+        print(f"   🔨 Criando role...")
+        pol = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}]}
+        iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(pol))
+        time.sleep(5); return role_name
+    except Exception as e: print(f"❌ Erro: {e}"); sys.exit(1)
+
+def resolve_resource(svc, func, key, create):
+    print(f"\n🔍 Buscando {svc}...")
+    cands = [i[key] for i in func() if 'velero' in i[key].lower()]
+    if not cands:
+        if CONFIG['env'] == 'PRD': print("⛔ PRD: Recurso não encontrado."); sys.exit(1)
+        return create()
+    elif len(cands) == 1: return cands[0]
+    else:
+        for i,n in enumerate(cands): print(f"   [{i}] {n}")
+        while True:
+            sel = get_smart_input("   Selecione o número: ")
+            if sel.isdigit() and 0 <= int(sel) < len(cands): return cands[int(sel)]
+            print(f"   ❌ Inválido.")
+
+# --- 4. PREPARAÇÃO ---
+def ensure_role_permissions(role_name):
+    print(f"   🛡️  Validando permissões da role '{role_name}'...")
+    iam = get_aws_session().client('iam')
+    try:
+        iam.put_role_policy(RoleName=role_name, PolicyName="VeleroPerms", PolicyDocument=json.dumps(VELERO_IAM_POLICY))
+        print("      ✅ Permissões aplicadas.")
+    except Exception as e: print(f"      ⚠️  Falha ao aplicar permissões: {e}")
+
+def generate_velero_values(bucket, role_arn, region):
+    print(f"\n📝 Gerando 'values.yaml'...")
+    yaml_content = f"""configuration:
+  backupStorageLocation:
+    - bucket: {bucket}
+      provider: aws
+      config:
+        region: {region}
+  volumeSnapshotLocation:
+    - provider: aws
+      config:
+        region: {region}
+credentials:
+  useSecret: false
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.9.0
+    volumeMounts:
+      - mountPath: /target
+        name: plugins
+serviceAccount:
+  server:
+    create: true
+    name: velero-server
+    annotations:
+      eks.amazonaws.com/role-arn: {role_arn}
+kubectl:
+  image:
+    repository: docker.io/bitnamilegacy/kubectl
+upgradeCRDs: false
+cleanUpCRDs: false
+"""
+    try:
+        with open("values.yaml", "w") as f: f.write(yaml_content)
+    except Exception as e: print(f"❌ Erro values.yaml: {e}"); sys.exit(1)
+
+def get_cluster_oidc(name):
+    return get_aws_session().client('eks').describe_cluster(name=name)['cluster']['identity']['oidc']['issuer'].replace("https://", "")
+
+def get_role_arn(name):
+    return get_aws_session().client('iam').get_role(RoleName=name)['Role']['Arn']
+
+def update_trust_policy(role, oidc, ns, sa):
+    iam = get_aws_session().client('iam'); sts = get_aws_session().client('sts')
+    acc = sts.get_caller_identity()["Account"]
+    oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
+    try:
+        pol = iam.get_role(RoleName=role)['Role']['AssumeRolePolicyDocument']
+        for s in pol['Statement']:
+            if s.get('Principal', {}).get('Federated') == oidc_arn:
+                cond = s.get('Condition', {}).get('StringEquals', {})
+                for k,v in cond.items():
+                    if f"{oidc}:sub" in k and v == f"system:serviceaccount:{ns}:{sa}": return False
+        print(f"   ➕ Autorizando OIDC na Role {role} para {sa}...")
+        pol['Statement'].append({
+            "Effect": "Allow", "Principal": {"Federated": oidc_arn}, "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {"StringEquals": {f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"}}
+        })
+        iam.update_assume_role_policy(RoleName=role, PolicyDocument=json.dumps(pol))
+        return True
+    except Exception as e: print(f"⚠️ Erro trust: {e}"); return False
+
+def run_pre_flight_irsa(ctx, dest_oidc):
+    print(f"\n🕵️  [IRSA] Preparando Apps em {ctx}...")
+    k8s_config.load_kube_config(context=ctx); v1 = client.CoreV1Api(); cnt = 0
+    for sa in v1.list_service_account_for_all_namespaces().items:
+        ns = sa.metadata.namespace
+        if ns in SYSTEM_NAMESPACES: continue
+        arn = (sa.metadata.annotations or {}).get('eks.amazonaws.com/role-arn')
+        if arn:
+            r = arn.split("/")[-1]
+            if r == CONFIG['velero_role'] or "aws-service-role" in r: continue
+            if update_trust_policy(r, dest_oidc, ns, sa.metadata.name): cnt += 1; time.sleep(0.2)
+    print(f"✅ {cnt} apps preparadas.")
+
+# --- 6. ISTIO SYNC ---
+def sanitize_k8s_object(obj):
+    if 'metadata' in obj:
+        for field in ['resourceVersion', 'uid', 'creationTimestamp', 'generation', 'ownerReferences', 'managedFields']:
+            obj['metadata'].pop(field, None)
+        annotations = obj['metadata'].get('annotations', {})
+        annotations.pop('kubectl.kubernetes.io/last-applied-configuration', None)
+        obj['metadata']['annotations'] = annotations
+    obj.pop('status', None)
+    return obj
+
+def sync_istio_resources(src_ctx, dst_ctx):
+    print(f"\n🕸️  [ISTIO] Sincronizando VirtualServices...")
+    k8s_config.load_kube_config(context=src_ctx)
+    custom_api_src = client.CustomObjectsApi()
+    ns_ignore_istio = [ns for ns in SYSTEM_NAMESPACES if ns != "istio-system"]
+    group = "networking.istio.io"; version = "v1beta1"; plural = "virtualservices"
+    candidates = []
+    try:
+        resp = custom_api_src.list_cluster_custom_object(group, version, plural)
+        valid_items = [i for i in resp.get('items', []) if i['metadata']['namespace'] not in ns_ignore_istio]
+        if not valid_items: print("    ℹ️  Nenhum VS encontrado."); return
+        print("\n📝 --- Selecione os VirtualServices ---")
+        for idx, item in enumerate(valid_items):
+            print(f"   [{idx}] {item['metadata']['namespace']} / {item['metadata']['name']}")
+        
+        while True:
+            sel = get_smart_input("\n👉 Números (ex: 0,2), 'all' ou 'none': ", default='none').lower()
+            if sel == 'none': return
+            if sel == 'all':
+                indices = range(len(valid_items))
+                break
+            try:
+                parts = [int(x.strip()) for x in sel.split(',') if x.strip().isdigit()]
+                if not parts or any(p < 0 or p >= len(valid_items) for p in parts):
+                    print(f"   ❌ Índices fora do intervalo.")
+                    continue
+                indices = parts
+                break
+            except: print("   ❌ Formato inválido.")
+
+        candidates = [sanitize_k8s_object(valid_items[i]) for i in indices]
+    except Exception as e: print(f"    ⚠️  Erro listagem: {e}"); return
+
+    if not candidates: return
+    print(f"    📤 Replicando {len(candidates)} VSs no Destino...")
+    k8s_config.load_kube_config(context=dst_ctx)
+    custom_api_dst = client.CustomObjectsApi()
+    cnt = 0
+    for body in candidates:
+        ns = body['metadata']['namespace']; name = body['metadata']['name']
+        try: client.CoreV1Api().create_namespace(client.V1Namespace(metadata=client.V1ObjectMeta(name=ns)))
+        except: pass
+        try:
+            custom_api_dst.create_namespaced_custom_object(group, version, ns, plural, body)
+            print(f"    ✅ Criado: {ns}/{name}"); cnt += 1
+        except client.exceptions.ApiException as e:
+            if e.status == 409:
+                try:
+                    exist = custom_api_dst.get_namespaced_custom_object(group, version, ns, plural, name)
+                    body['metadata']['resourceVersion'] = exist['metadata']['resourceVersion']
+                    custom_api_dst.replace_namespaced_custom_object(group, version, ns, plural, name, body)
+                    print(f"    🔄 Atualizado: {ns}/{name}"); cnt += 1
+                except: print(f"    ❌ Falha update: {name}")
+            else: print(f"    ❌ Falha create: {name}")
+    print(f"✅ {cnt} VSs sincronizados.")
+
+# --- 7. VELERO CONTROL ---
+def wait_for_backup_sync(bk):
+    print(f"⏳ Aguardando sync do backup '{bk}' no destino...")
+    for i in range(24):
+        res = subprocess.run(f"velero backup describe {bk}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0: print(f"   ✅ Backup disponível!"); return True
+        time.sleep(5)
+    print("\n❌ Timeout sync."); return False
+
+def force_delete_namespace(ns):
+    cmd = (f"kubectl get namespace {ns} -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/{ns}/finalize -f -")
+    run_shell(cmd, ignore_error=True, quiet=True)
+
+def cleanup_velero(context):
+    print(f"🧹 [CLEANUP] Limpando {context}...")
+    run_shell(f"kubectl config use-context {context}", quiet=True)
+    run_shell("helm uninstall velero -n velero", ignore_error=True, quiet=True)
+    proc = subprocess.Popen("kubectl delete ns velero --timeout=15s", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try: proc.wait(timeout=15)
+    except subprocess.TimeoutExpired: force_delete_namespace("velero")
+    time.sleep(5)
+
+def install_velero(context):
+    if CONFIG['cleanup']: cleanup_velero(context)
+    print(f"⚓ [{context}] Instalando Velero...")
+    run_shell(f"kubectl config use-context {context}", quiet=True)
+    run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
+    cmd = f"helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait"
+    run_shell(cmd, quiet=True)
+    run_shell("kubectl rollout restart deployment velero -n velero", quiet=True)
+
+# --- MAIN ---
+def main():
+    get_inputs_initial()
+    print("\n🖥️ --- Definição dos Clusters ---")
+    c_src, ctx_src = select_cluster("   \n👉 Selecione o Cluster ORIGEM:")
+    c_dst, ctx_dst = select_cluster("   \n👉 Selecione o Cluster DESTINO:")
+
+    s3 = get_aws_session().client('s3'); iam = get_aws_session().client('iam')
+    CONFIG['bucket'] = resolve_resource("Bucket", lambda: s3.list_buckets()['Buckets'], 'Name', create_bucket)
+    CONFIG['velero_role'] = resolve_resource("Role", lambda: iam.list_roles()['Roles'], 'RoleName', create_role)
+    
+    ensure_role_permissions(CONFIG['velero_role'])
+    generate_velero_values(CONFIG['bucket'], get_role_arn(CONFIG['velero_role']), CONFIG['region'])
+
+    print("\n☁️  Configurando OIDCs e Permissões...")
+    oidc_src = get_cluster_oidc(c_src); oidc_dst = get_cluster_oidc(c_dst)
+    update_trust_policy(CONFIG['velero_role'], oidc_src, "velero", "velero-server")
+    update_trust_policy(CONFIG['velero_role'], oidc_dst, "velero", "velero-server")
+    
+    run_pre_flight_irsa(ctx_src, oidc_dst)
+    sync_istio_resources(ctx_src, ctx_dst)
+
+    bk = f"migracao-{CONFIG['env'].lower()}-{int(time.time())}"
+
+    print(f"\n--- 🚀 FASE ORIGEM ---")
+    install_velero(ctx_src)
+    print(f"💾 Criando Backup: {bk}")
+    try:
+        run_shell(f"velero backup create {bk} --exclude-namespaces {','.join(SYSTEM_NAMESPACES)} --exclude-resources {EXCLUDE_RESOURCES} --wait")
+        print("⏳ Aguardando 60s para consolidação do Snapshot na AWS...")
+        time.sleep(60) 
+    except SystemExit:
+        if get_smart_input("   ⚠️ Backup falhou. Continuar? (s/n): ", default='n', options=['s','n']).lower() != 's': sys.exit(1)
+
+    print(f"\n--- 🛬 FASE DESTINO ---")
+    install_velero(ctx_dst)
+    
+    if wait_for_backup_sync(bk):
+        print("\n✋ --- Ponto de Decisão ---")
+        if get_smart_input(f"   Restaurar backup '{bk}' AGORA? (s/n) [n]: ", default='n', options=['s','n']).lower() == 's':
+            print(f"♻️  Iniciando Restore...")
+            run_shell(f"velero restore create --from-backup {bk} --existing-resource-policy update --exclude-resources {EXCLUDE_RESOURCES} --wait")
+            print("\n🎉 Migração realizada com sucesso!")
+        else:
+            print(f"\nℹ️  Restore adiado. Comando para rodar depois:")
+            print(f"   velero restore create --from-backup {bk} --existing-resource-policy update --exclude-resources {EXCLUDE_RESOURCES} --wait")
+    else:
+        print("\n⛔ Restore abortado (Timeout).")
+
+    print("\n✅ Fim do Script.")
 
 if __name__ == "__main__":
     main()
