@@ -1,22 +1,39 @@
-# 1. Defina as variáveis (Simulando os parâmetros do Jenkins)
-export ENV_TYPE="DEV"
+#!/bin/bash
+
+# ==========================================
+# SIMULADOR DE PIPELINE (Teste Local)
+# Preencha os dados abaixo antes de rodar.
+# ==========================================
+
+# --- 1. Configurações Gerais ---
+export ENV_TYPE="DEV"                        # Opções: DEV, HML, PRD
 export AWS_REGION="us-east-1"
-export OPERATION_MODE="FULL_MIGRATION" # ou BACKUP_ONLY, RESTORE_ONLY
+export OPERATION_MODE="FULL_MIGRATION"       # Opções: FULL_MIGRATION, BACKUP_ONLY, RESTORE_ONLY
 
-# Seus recursos (já devem existir)
-export VELERO_BUCKET_NAME="velero-backup-dev-SUA_CONTA"
-export VELERO_ROLE_ARN="arn:aws:iam::SUA_CONTA:role/velero-role-dev-auto"
+# --- 2. Autenticação (SSO Profile) ---
+# Deve ser o nome exato do profile configurado no seu ~/.aws/config
+export AWS_PROFILE="default"
 
-# Seus Clusters
-export CLUSTER_SOURCE_NAME="migrate-eks-origem-pxdu7DEz"
-export CLUSTER_DEST_NAME="migrate-eks-destino-B7GvqvxU"
+# --- 3. Infraestrutura Velero (Já existentes) ---
+export VELERO_BUCKET_NAME="nome-do-seu-bucket-velero"
+export VELERO_ROLE_ARN="arn:aws:iam::123456789012:role/sua-role-velero"
 
-# IMPORTANTE: Seu profile local da AWS (~/.aws/credentials)
-export AWS_PROFILE="default" 
+# --- 4. Clusters EKS ---
+export CLUSTER_SOURCE_NAME="nome-cluster-origem"  # Obrigatório para FULL e BACKUP
+export CLUSTER_DEST_NAME="nome-cluster-destino"   # Obrigatório para FULL e RESTORE
 
-# Opcionais
-export ISTIO_SYNC_MODE="all"
-export CLEANUP_ENABLED="true"
+# --- 5. Opcionais ---
+export ISTIO_SYNC_MODE="all"                      # 'all', 'none' ou lista 'vs-app1,vs-app2'
+export CLEANUP_ENABLED="true"                     # 'true' ou 'false'
 
-# 2. Roda o script
-python3 migracao_jenkins.py
+# Apenas se OPERATION_MODE="RESTORE_ONLY"
+# export BACKUP_NAME_TO_RESTORE="migracao-1700000000"
+
+# ==========================================
+# EXECUÇÃO
+# ==========================================
+echo "🚀 Iniciando automação local..."
+echo "📂 Profile: $AWS_PROFILE | Modo: $OPERATION_MODE"
+
+# O flag -u garante que o log saia em tempo real
+python3 -u corp.py
