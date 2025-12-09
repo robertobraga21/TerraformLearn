@@ -64,12 +64,11 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V61 (Host Native) ---")
+    print("\n🚀 --- Migração EKS V64 (Mandatory Cleanup) ---")
     
     CONFIG['region'] = get_required_env("AWS_REGION")
     CONFIG['mode'] = get_required_env("OPERATION_MODE") 
     
-    # Perfil injetado pelo Jenkins Choice Parameter
     CONFIG['aws_profile'] = get_required_env("AWS_PROFILE")
     
     CONFIG['bucket_name'] = get_required_env("VELERO_BUCKET_NAME")
@@ -90,16 +89,14 @@ def load_config():
         sys.exit(1)
 
     CONFIG['istio_sync_mode'] = get_env_opt("ISTIO_SYNC_MODE", "all").lower()
-    CONFIG['cleanup'] = get_env_opt("CLEANUP_ENABLED", "false").lower() == 'true'
+    
+    # REMOVIDO: Leitura de CLEANUP_ENABLED. Agora é hardcoded como comportamento padrão.
 
     print(f"   ℹ️  Modo: {CONFIG['mode']}")
     print(f"   ℹ️  Profile: {CONFIG['aws_profile']}")
     print(f"   ℹ️  Região: {CONFIG['region']}")
-    if CONFIG['cluster_src']: print(f"   ℹ️  Origem: {CONFIG['cluster_src']}")
-    if CONFIG['cluster_dst']: print(f"   ℹ️  Destino: {CONFIG['cluster_dst']}")
 
 def get_aws_session():
-    # Usa o profile selecionado
     return boto3.Session(profile_name=CONFIG['aws_profile'], region_name=CONFIG['region'])
 
 # --- 2. VALIDAÇÃO AWS ---
@@ -125,7 +122,6 @@ def extract_and_validate_role(role_arn):
 def setup_kube_context(cluster_name):
     print(f"   🔍 Configurando kubeconfig para '{cluster_name}'...")
     try:
-        # Usa --profile no comando AWS CLI
         cmd = f"aws eks update-kubeconfig --name {cluster_name} --region {CONFIG['region']} --profile {CONFIG['aws_profile']}"
         run_shell(cmd, quiet=True)
         eks = get_aws_session().client('eks')
@@ -286,7 +282,7 @@ def backup_istio_to_s3(src_ctx, backup_name):
     try:
         resp = custom_api.list_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices")
         items = resp.get('items', [])
-    except Exception as e: print(f"   ⚠️  Erro Istio: {e}"); return
+    except Exception as e: print(f"   ⚠️  Erro lendo Istio: {e}"); return
 
     tmp_dir = f"istio_tmp_{backup_name}"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -372,7 +368,9 @@ def cleanup_velero(context):
         time.sleep(2)
 
 def install_velero(context):
+    # CHAMADA INCONDICIONAL DE LIMPEZA
     cleanup_velero(context)
+    
     print(f"⚓ [{context}] Instalando Velero...")
     run_shell(f"kubectl config use-context {context}", quiet=True)
     run_shell("kubectl create ns velero --dry-run=client -o yaml | kubectl apply -f -", quiet=True)
