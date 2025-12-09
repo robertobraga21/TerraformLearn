@@ -2,38 +2,26 @@
 
 # ==========================================
 # SIMULADOR DE PIPELINE (Teste Local)
-# Preencha os dados abaixo antes de rodar.
 # ==========================================
 
-# --- 1. Configurações Gerais ---
-export ENV_TYPE="DEV"                        # Opções: DEV, HML, PRD
+# 1. Configurações Básicas
+export OPERATION_MODE="FULL_MIGRATION"       # FULL_MIGRATION, BACKUP_ONLY, RESTORE_ONLY
 export AWS_REGION="us-east-1"
-export OPERATION_MODE="FULL_MIGRATION"       # Opções: FULL_MIGRATION, BACKUP_ONLY, RESTORE_ONLY
+export AWS_PROFILE="default"                 # Seu profile local
 
-# --- 2. Autenticação (SSO Profile) ---
-# Deve ser o nome exato do profile configurado no seu ~/.aws/config
-export AWS_PROFILE="default"
+# 2. Infraestrutura
+export VELERO_BUCKET_NAME="velero-backup-dev-925774240266"
+export VELERO_ROLE_ARN="arn:aws:iam::925774240266:role/velero-role-dev-auto"
 
-# --- 3. Infraestrutura Velero (Já existentes) ---
-export VELERO_BUCKET_NAME="nome-do-seu-bucket-velero"
-export VELERO_ROLE_ARN="arn:aws:iam::123456789012:role/sua-role-velero"
+# 3. Clusters
+export CLUSTER_SOURCE_NAME="migrate-eks-origem-pxdu7DEz"
+export CLUSTER_DEST_NAME="migrate-eks-destino-B7GvqvxU"
 
-# --- 4. Clusters EKS ---
-export CLUSTER_SOURCE_NAME="nome-cluster-origem"  # Obrigatório para FULL e BACKUP
-export CLUSTER_DEST_NAME="nome-cluster-destino"   # Obrigatório para FULL e RESTORE
+# 4. Opcionais
+export ISTIO_SYNC_MODE="all"
 
-# --- 5. Opcionais ---
-export ISTIO_SYNC_MODE="all"                      # 'all', 'none' ou lista 'vs-app1,vs-app2'
-export CLEANUP_ENABLED="true"                     # 'true' ou 'false'
-
-# Apenas se OPERATION_MODE="RESTORE_ONLY"
+# (Opcional) Apenas para RESTORE_ONLY
 # export BACKUP_NAME_TO_RESTORE="migracao-1700000000"
 
-# ==========================================
-# EXECUÇÃO
-# ==========================================
-echo "🚀 Iniciando automação local..."
-echo "📂 Profile: $AWS_PROFILE | Modo: $OPERATION_MODE"
-
-# O flag -u garante que o log saia em tempo real
-python3 -u corp.py
+echo "🚀 Rodando migração local..."
+python3 -u migracao_jenkins.py
