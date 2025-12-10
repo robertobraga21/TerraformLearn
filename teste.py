@@ -17,29 +17,6 @@ SYSTEM_NAMESPACES = [
 
 EXCLUDE_RESOURCES = "pods,replicasets,endpoints,endpointslices"
 
-# MANTIDO APENAS PARA REFERÊNCIA (Não é mais aplicado via script)
-VELERO_IAM_POLICY = {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ec2:DescribeVolumes", "ec2:DescribeSnapshots", "ec2:CreateTags",
-                "ec2:CreateVolume", "ec2:CreateSnapshot", "ec2:DeleteSnapshot"
-            ],
-            "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject", "s3:DeleteObject", "s3:PutObject",
-                "s3:AbortMultipartUpload", "s3:ListBucket"
-            ],
-            "Resource": "*" 
-        }
-    ]
-}
-
 # --- 0. HELPERS ---
 def get_smart_input(prompt_text, default=None, options=None, regex=None):
     while True:
@@ -75,17 +52,13 @@ def get_inputs_initial():
     
     print("\n🔑 --- Autenticação AWS (Profile Obrigatório) ---")
     
-    # Lista profiles disponíveis na máquina
     available_profiles = boto3.Session().available_profiles
-    
     if not available_profiles:
         print("   ⛔ ERRO: Nenhum profile AWS encontrado em ~/.aws/credentials ou ~/.aws/config.")
-        print("   Configure suas credenciais (aws configure) antes de rodar este script.")
         sys.exit(1)
         
     print(f"   Profiles detectados: {', '.join(available_profiles)}")
     
-    # Validação estrita: O usuário DEVE digitar um profile que existe
     while True:
         p_input = get_smart_input("   Digite o nome do Profile: ")
         if p_input in available_profiles:
@@ -93,7 +66,6 @@ def get_inputs_initial():
             break
         print(f"   ❌ O profile '{p_input}' não existe. Tente novamente.")
 
-    # Cria sessão temporária com o profile escolhido para detectar região default
     try:
         temp_session = boto3.Session(profile_name=CONFIG['aws_profile'])
         detected_region = temp_session.region_name if temp_session.region_name else "us-east-1"
@@ -114,7 +86,6 @@ def get_inputs_initial():
         CONFIG['cleanup'] = True
 
 def get_aws_session():
-    # Sempre usa o profile definido
     return boto3.Session(profile_name=CONFIG['aws_profile'], region_name=CONFIG['region'])
 
 # --- 2. SELEÇÃO DE CLUSTER ---
@@ -158,73 +129,13 @@ def resolve_kube_context_logic(cluster_name, cluster_arn):
     except: pass
     
     print(f"      ℹ️  Gerando contexto local para {cluster_name}...")
-    # Força o uso do profile no comando AWS CLI
     cmd = f"aws eks update-kubeconfig --name {cluster_name} --region {CONFIG['region']} --profile {CONFIG['aws_profile']}"
     run_shell(cmd, quiet=True)
     return cluster_arn
 
-# --- 3. RECURSOS AWS ---
-def create_bucket():
-    s3 = get_aws_session().client('s3'); sts = get_aws_session().client('sts')
-    acc = sts.get_caller_identity()["Account"]
-    default_name = f"velero-backup-{CONFIG['env'].lower()}-{acc}"
-    print(f"\n⚠️  Nenhum bucket encontrado.")
-    while True:
-        print(f"   Sugestão: {default_name}")
-        bucket_name = get_smart_input("   Nome desejado (Enter para sugestão): ", default=default_name)
-        try:
-            s3.head_bucket(Bucket=bucket_name)
-            print(f"   ❌ '{bucket_name}' JÁ EXISTE! Tente outro.")
-        except ClientError as e:
-            if int(e.response['Error']['Code']) == 404: break 
-            elif int(e.response['Error']['Code']) == 403: print(f"   ❌ Sem permissão.")
-            else: print(f"   ❌ Erro: {e}")
-    try:
-        print(f"   🔨 Criando bucket...")
-        if CONFIG['region'] == 'us-east-1': s3.create_bucket(Bucket=bucket_name)
-        else: s3.create_bucket(Bucket=bucket_name, CreateBucketConfiguration={'LocationConstraint': CONFIG['region']})
-        return bucket_name
-    except Exception as e: print(f"❌ Erro: {e}"); sys.exit(1)
-
-def create_role():
-    iam = get_aws_session().client('iam'); sts = get_aws_session().client('sts')
-    acc = sts.get_caller_identity()["Account"]
-    default_name = f"velero-role-{CONFIG['env'].lower()}-auto"
-    print(f"\n⚠️  Nenhuma role encontrada.")
-    while True:
-        print(f"   Sugestão: {default_name}")
-        role_name = get_smart_input("   Nome desejado (Enter para sugestão): ", default=default_name)
-        try:
-            iam.get_role(RoleName=role_name)
-            print(f"   ❌ Role '{role_name}' JÁ EXISTE! Tente outro.")
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchEntity': break
-            else: print(f"   ❌ Erro: {e}")
-    try:
-        print(f"   🔨 Criando role...")
-        pol = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}]}
-        iam.create_role(RoleName=role_name, AssumeRolePolicyDocument=json.dumps(pol))
-        time.sleep(5); return role_name
-    except Exception as e: print(f"❌ Erro: {e}"); sys.exit(1)
-
-def resolve_resource(svc, func, key, create):
-    print(f"\n🔍 Buscando {svc}...")
-    cands = [i[key] for i in func() if 'velero' in i[key].lower()]
-    if not cands:
-        if CONFIG['env'] == 'PRD': print("⛔ PRD: Recurso não encontrado."); sys.exit(1)
-        return create()
-    elif len(cands) == 1: return cands[0]
-    else:
-        for i,n in enumerate(cands): print(f"   [{i}] {n}")
-        while True:
-            sel = get_smart_input("   Selecione o número: ")
-            if sel.isdigit() and 0 <= int(sel) < len(cands): return cands[int(sel)]
-            print(f"   ❌ Inválido.")
-
-# --- 4. PREPARAÇÃO (MODIFICADO) ---
+# --- 3. PREPARAÇÃO (MANUAL INPUT) ---
 def ensure_role_permissions(role_name):
-    # Alteração solicitada: Não tenta aplicar inline policy.
-    # Assume que a role já possui as permissões necessárias (via IaC).
+    # Skip validation logic for Production
     print(f"   🛡️  [SKIP] Validação de permissões ignorada (Ambiente Controlado).")
     print(f"       ℹ️  Assumindo que a role '{role_name}' já possui acesso ao S3 e EC2.")
 
@@ -303,7 +214,7 @@ def run_pre_flight_irsa(ctx, dest_oidc):
             if update_trust_policy(r, dest_oidc, ns, sa.metadata.name): cnt += 1; time.sleep(0.2)
     print(f"✅ {cnt} apps preparadas.")
 
-# --- 6. ISTIO SYNC ---
+# --- 4. ISTIO SYNC ---
 def sanitize_k8s_object(obj):
     if 'metadata' in obj:
         for field in ['resourceVersion', 'uid', 'creationTimestamp', 'generation', 'ownerReferences', 'managedFields']:
@@ -370,7 +281,7 @@ def sync_istio_resources(src_ctx, dst_ctx):
             else: print(f"    ❌ Falha create: {name}")
     print(f"✅ {cnt} VSs sincronizados.")
 
-# --- 7. VELERO CONTROL ---
+# --- 5. VELERO CONTROL ---
 def wait_for_backup_sync(bk):
     print(f"⏳ Aguardando sync do backup '{bk}' no destino...")
     for i in range(24):
@@ -404,17 +315,46 @@ def install_velero(context):
 # --- MAIN ---
 def main():
     get_inputs_initial()
+    s3 = get_aws_session().client('s3')
+    iam = get_aws_session().client('iam')
+
     print("\n🖥️ --- Definição dos Clusters ---")
     c_src, ctx_src = select_cluster("   \n👉 Selecione o Cluster ORIGEM:")
     c_dst, ctx_dst = select_cluster("   \n👉 Selecione o Cluster DESTINO:")
 
-    s3 = get_aws_session().client('s3'); iam = get_aws_session().client('iam')
-    CONFIG['bucket'] = resolve_resource("Bucket", lambda: s3.list_buckets()['Buckets'], 'Name', create_bucket)
-    CONFIG['velero_role'] = resolve_resource("Role", lambda: iam.list_roles()['Roles'], 'RoleName', create_role)
+    # --- NOVO BLOCO: INPUT MANUAL ---
+    print("\n📦 --- Definição de Recursos (Manual) ---")
     
-    # Versão atualizada: apenas loga, não injeta policy.
+    # Bucket Input e Validação
+    while True:
+        b_input = get_smart_input("   Digite o nome do Bucket S3 de Backup: ")
+        try:
+            # Verifica se o bucket existe e é acessível
+            s3.head_bucket(Bucket=b_input)
+            print(f"      ✅ Bucket '{b_input}' verificado.")
+            CONFIG['bucket'] = b_input
+            break
+        except Exception as e:
+            print(f"      ❌ Erro ao validar bucket: {e}")
+            if get_smart_input("      Deseja tentar outro nome? (s/n) [s]: ", default='s').lower() == 'n':
+                sys.exit(1)
+
+    # Role Input e Validação
+    while True:
+        r_input = get_smart_input("   Digite o nome da IAM Role do Velero: ")
+        try:
+            # Verifica se a role existe
+            iam.get_role(RoleName=r_input)
+            print(f"      ✅ Role '{r_input}' verificada.")
+            CONFIG['velero_role'] = r_input
+            break
+        except Exception as e:
+            print(f"      ❌ Erro ao validar role: {e}")
+            if get_smart_input("      Deseja tentar outro nome? (s/n) [s]: ", default='s').lower() == 'n':
+                sys.exit(1)
+    # --------------------------------
+
     ensure_role_permissions(CONFIG['velero_role'])
-    
     generate_velero_values(CONFIG['bucket'], get_role_arn(CONFIG['velero_role']), CONFIG['region'])
 
     print("\n☁️  Configurando OIDCs e Permissões...")
