@@ -17,6 +17,7 @@ SYSTEM_NAMESPACES = [
 
 EXCLUDE_RESOURCES = "pods,replicasets,endpoints,endpointslices"
 
+# MANTIDO APENAS PARA REFERÊNCIA (Não é mais aplicado via script)
 VELERO_IAM_POLICY = {
     "Version": "2012-10-17",
     "Statement": [
@@ -220,14 +221,12 @@ def resolve_resource(svc, func, key, create):
             if sel.isdigit() and 0 <= int(sel) < len(cands): return cands[int(sel)]
             print(f"   ❌ Inválido.")
 
-# --- 4. PREPARAÇÃO ---
+# --- 4. PREPARAÇÃO (MODIFICADO) ---
 def ensure_role_permissions(role_name):
-    print(f"   🛡️  Validando permissões da role '{role_name}'...")
-    iam = get_aws_session().client('iam')
-    try:
-        iam.put_role_policy(RoleName=role_name, PolicyName="VeleroPerms", PolicyDocument=json.dumps(VELERO_IAM_POLICY))
-        print("      ✅ Permissões aplicadas.")
-    except Exception as e: print(f"      ⚠️  Falha ao aplicar permissões: {e}")
+    # Alteração solicitada: Não tenta aplicar inline policy.
+    # Assume que a role já possui as permissões necessárias (via IaC).
+    print(f"   🛡️  [SKIP] Validação de permissões ignorada (Ambiente Controlado).")
+    print(f"       ℹ️  Assumindo que a role '{role_name}' já possui acesso ao S3 e EC2.")
 
 def generate_velero_values(bucket, role_arn, region):
     print(f"\n📝 Gerando 'values.yaml'...")
@@ -413,7 +412,9 @@ def main():
     CONFIG['bucket'] = resolve_resource("Bucket", lambda: s3.list_buckets()['Buckets'], 'Name', create_bucket)
     CONFIG['velero_role'] = resolve_resource("Role", lambda: iam.list_roles()['Roles'], 'RoleName', create_role)
     
+    # Versão atualizada: apenas loga, não injeta policy.
     ensure_role_permissions(CONFIG['velero_role'])
+    
     generate_velero_values(CONFIG['bucket'], get_role_arn(CONFIG['velero_role']), CONFIG['region'])
 
     print("\n☁️  Configurando OIDCs e Permissões...")
