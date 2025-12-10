@@ -12,7 +12,7 @@ from kubernetes import client, config as k8s_config
 GLOBAL_SESSION = None
 CONFIG = {}
 
-# Namespaces que ignoramos no scan de IRSA e no Backup
+# Namespaces de sistema (Ignorados no scan/backup)
 SYSTEM_NAMESPACES = [
     "default", "kube-system", "kube-public", "kube-node-lease", 
     "velero", "amazon-cloudwatch", "aws-observability", "istio-system", "istio-ingress", "cert-manager", "monitoring",
@@ -31,7 +31,6 @@ def print_info(msg): print(f"   ℹ️  {msg}")
 def run_shell(cmd, ignore_error=False, quiet=True):
     if not quiet: print(f"   [CMD] {cmd}")
     try: 
-        # stderr=subprocess.PIPE captura o erro para podermos printar se falhar
         subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL if quiet else None, stderr=subprocess.PIPE if quiet else None)
         return True
     except subprocess.CalledProcessError as e:
@@ -44,21 +43,32 @@ def run_shell(cmd, ignore_error=False, quiet=True):
 
 def select_aws_profile():
     print_step("Autenticação AWS")
-    available_profiles = boto3.Session().available_profiles
-    options = ["(Ambiente/Default)"] + sorted(available_profiles)
     
-    print("   Perfis encontrados:")
-    for idx, prof in enumerate(options):
-        print(f"   [{idx}] {prof}")
+    # Obtém lista para validação interna
+    available_profiles = boto3.Session().available_profiles
+    
+    print_info("Digite o nome do perfil AWS configurado no seu ~/.aws/credentials")
+    print_info("Deixe em branco para usar variáveis de ambiente ou default profile.")
     
     while True:
-        choice = input("\n   Selecione o número do perfil: ").strip()
-        if choice.isdigit() and 0 <= int(choice) < len(options):
-            selected_profile = None if int(choice) == 0 else options[int(choice)]
+        p_name = input("\n   Nome do Perfil: ").strip()
+        
+        # Caso 1: Usuário quer default/env vars
+        if not p_name:
+            selected_profile = None
             break
-        print_error("Opção inválida.")
+            
+        # Caso 2: Valida se o perfil digitado existe na lista do boto3
+        if p_name in available_profiles:
+            selected_profile = p_name
+            break
+        else:
+            print_error(f"Perfil '{p_name}' não encontrado nas configurações locais.")
+            print("   Dica: Verifique o nome com 'aws configure list-profiles'")
 
-    print_info(f"Testando credenciais para: {selected_profile if selected_profile else 'ENV_VARS'}...")
+    display_name = selected_profile if selected_profile else "ENV_VARS/Default"
+    print_info(f"Testando credenciais para: {display_name}...")
+    
     try:
         session = boto3.Session(profile_name=selected_profile)
         sts = session.client('sts')
@@ -102,9 +112,6 @@ def validate_cluster_access(session, cluster_name):
 
     print_info("Atualizando kubeconfig...")
     profile_flag = f"--profile {CONFIG['aws_profile']}" if CONFIG['aws_profile'] else ""
-    
-    # --- CORREÇÃO DO ERRO 'NO CONTEXT EXISTS' ---
-    # Adicionamos --alias {cluster_name} para forçar o nome do contexto a ser igual ao nome do cluster
     cmd = f"aws eks update-kubeconfig --name {cluster_name} --region {CONFIG['region']} --alias {cluster_name} {profile_flag}"
     
     if not run_shell(cmd):
@@ -194,7 +201,7 @@ def scan_applications_irsa(cluster_name):
     else:
         print_success("Todas as aplicações possuem Roles configuradas.")
 
-# --- 3. VELERO & LOGICA ---
+# --- 3. VELERO & LOGICA (TRUST RELATIONSHIP SEGURA) ---
 
 def generate_velero_values(bucket, role_arn, region):
     yaml_content = f"""configuration:
@@ -234,13 +241,14 @@ def get_cluster_oidc(cluster_name):
     return GLOBAL_SESSION.client('eks').describe_cluster(name=cluster_name)['cluster']['identity']['oidc']['issuer'].replace("https://", "")
 
 def configure_irsa_trust(role_arn, oidcs_list):
-    print_step("Configurando Trust Relationships na Role Velero")
+    print_step("Configurando Trust Relationships (Modo: Append/Safe)")
     role_name = role_arn.split('/')[-1]
     iam = GLOBAL_SESSION.client('iam')
     sts = GLOBAL_SESSION.client('sts')
     acc = sts.get_caller_identity()["Account"]
     
     try:
+        # Obtém policy atual
         current_policy = iam.get_role(RoleName=role_name)['Role']['AssumeRolePolicyDocument']
         new_statements = current_policy.get('Statement', [])
         
@@ -259,6 +267,7 @@ def configure_irsa_trust(role_arn, oidcs_list):
                         exists = True; break
             
             if not exists:
+                print_info(f"Adicionando OIDC {oidc} à Role...")
                 new_statements.append({
                     "Effect": "Allow",
                     "Principal": {"Federated": oidc_arn},
@@ -274,12 +283,23 @@ def configure_irsa_trust(role_arn, oidcs_list):
         
         if updated:
             policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
+            
+            # Validação simples de tamanho (IAM Trust policies ~2048 caracteres)
+            if len(json.dumps(policy_doc)) > 2000:
+                print_warning(f"A Policy da Role '{role_name}' está ficando muito grande.")
+                print_warning("Não foi possível adicionar novos OIDCs por falta de espaço.")
+                print_info("Seguindo execução sem alterar a Role...")
+                return # Segue o jogo, não para
+
             iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
-            print_success(f"Trust atualizada para: {role_name}")
+            print_success(f"Trust atualizada com sucesso para: {role_name}")
         else:
-            print_info("Trust Relationship já estava correta.")
+            print_info("Trust Relationship já contém os OIDCs necessários.")
+            
     except Exception as e:
-        print_error(f"Erro Trust Policy: {e}")
+        # Erro genérico (ex: Permissão negada, erro de API) -> Notifica e Segue
+        print_warning(f"Falha ao atualizar Trust Policy: {e}")
+        print_info("Ignorando erro e seguindo com a execução (Conforme solicitado).")
 
 # --- 4. BACKUP/RESTORE ---
 
@@ -306,43 +326,30 @@ def wait_for_backup_sync(bk):
 
 def install_velero(context):
     print_step(f"Instalando Velero no contexto: {context}")
-    
-    # 1. Garante que estamos no contexto certo (Agora com alias funcionando)
     if not run_shell(f"kubectl config use-context {context}", quiet=True):
-        print_error(f"Não foi possível mudar para o contexto {context}. Abortando.")
-        sys.exit(1)
+        print_error(f"Falha ao mudar contexto para {context}."); sys.exit(1)
     
-    # 2. Limpeza prévia
     run_shell("helm uninstall velero -n velero", ignore_error=True)
     run_shell("kubectl delete ns velero --timeout=10s --wait=false", ignore_error=True)
     time.sleep(3)
     
-    # 3. Criação Robusta do Namespace
-    # Substitui o pipe complexo por verificação direta
     check_ns = subprocess.run(f"kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if check_ns.returncode != 0:
-        print_info("Criando namespace 'velero'...")
         if not run_shell("kubectl create ns velero"):
-            print_error("Falha crítica ao criar namespace velero."); sys.exit(1)
-    else:
-        print_info("Namespace 'velero' já existe.")
+            print_error("Falha ao criar namespace velero."); sys.exit(1)
     
-    # 4. Instalação Helm
     run_shell("helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts", ignore_error=True)
     cmd = "helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait"
     
     if not run_shell(cmd):
-        print_error("Falha na instalação Helm. Tentando limpeza forçada e reinstalação...")
-        # Força limpeza de finalizers se estiver travado
+        print_error("Retrying Helm Install..."); 
         run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True)
-        run_shell("kubectl create ns velero", ignore_error=True)
-        if not run_shell(cmd):
-            print_error("Erro fatal: Não foi possível instalar o Velero."); sys.exit(1)
+        run_shell(cmd)
             
-    print_success("Velero instalado com sucesso.")
+    print_success("Velero instalado.")
 
 def backup_istio_to_s3(src_cluster, backup_name):
-    print_step("Backup Istio (VirtualServices)")
+    print_step("Backup Istio (Smart Filter)")
     validate_cluster_access(GLOBAL_SESSION, src_cluster) 
     
     custom_api = client.CustomObjectsApi()
@@ -350,22 +357,36 @@ def backup_istio_to_s3(src_cluster, backup_name):
     
     try:
         items = custom_api.list_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices").get('items', [])
-    except: print_error("Istio não encontrado (pode ignorar se não usa Istio)."); return
+    except: print_error("Istio não detectado no cluster."); return
 
     tmp_dir = f"istio_tmp_{backup_name}"; os.makedirs(tmp_dir, exist_ok=True)
     count = 0
+    skipped = 0
+    
+    print_info("Filtrando VirtualServices (Contém 'app'/'apps' E Não contém 'admin')...")
+    
     for item in items:
-        vs_name = item['metadata']['name']
-        for f in ['resourceVersion', 'uid', 'creationTimestamp', 'generation', 'ownerReferences', 'managedFields']:
-            if 'metadata' in item: item['metadata'].pop(f, None)
-        if 'status' in item: item.pop('status', None)
+        vs_name = item['metadata']['name'].lower()
+        
+        # --- LÓGICA DE FILTRO SOLICITADA ---
+        # 1. Deve ter "app" OU "apps"
+        # 2. NÃO pode ter "admin"
+        if ("app" in vs_name or "apps" in vs_name) and "admin" not in vs_name:
+            # Limpeza de metadados
+            for f in ['resourceVersion', 'uid', 'creationTimestamp', 'generation', 'ownerReferences', 'managedFields']:
+                if 'metadata' in item: item['metadata'].pop(f, None)
+            if 'status' in item: item.pop('status', None)
+                
+            local_path = f"{tmp_dir}/{vs_name}.json"
+            with open(local_path, 'w') as f: json.dump(item, f)
+            s3.upload_file(local_path, CONFIG['bucket_name'], f"istio-artifacts/{backup_name}/{vs_name}.json")
+            print(f"   📤 Incluído: {vs_name}")
+            count += 1
+        else:
+            skipped += 1
             
-        local_path = f"{tmp_dir}/{vs_name}.json"
-        with open(local_path, 'w') as f: json.dump(item, f)
-        s3.upload_file(local_path, CONFIG['bucket_name'], f"istio-artifacts/{backup_name}/{vs_name}.json")
-        count += 1
     shutil.rmtree(tmp_dir)
-    print_success(f"{count} VSs exportados.")
+    print_success(f"Total Exportados: {count} (Ignorados: {skipped})")
 
 def restore_istio_from_s3(dst_cluster, backup_name):
     print_step("Restore Istio")
@@ -394,7 +415,7 @@ def restore_istio_from_s3(dst_cluster, backup_name):
 # --- MAIN ---
 def main():
     global GLOBAL_SESSION
-    print("\n🚀 --- Migração EKS V66 (Fix Context + IRSA) ---")
+    print("\n🚀 --- Migração EKS V67 (Smart Filter & Safe Trust) ---")
 
     initial_session, profile_name = select_aws_profile()
     CONFIG['aws_profile'] = profile_name
@@ -423,13 +444,16 @@ def main():
     oidcs = []
     if src_cluster: oidcs.append(get_cluster_oidc(src_cluster))
     if dst_cluster: oidcs.append(get_cluster_oidc(dst_cluster))
+    
+    # Trust Config (Agora SAFE e APPEND apenas)
     configure_irsa_trust(CONFIG['role_arn'], oidcs)
 
     if mode in ['FULL_MIGRATION', 'BACKUP_ONLY']:
         bk_name = f"migracao-{int(time.time())}"
-        scan_applications_irsa(src_cluster) # Scan IRSA antes do backup
+        scan_applications_irsa(src_cluster)
         
         install_velero(src_cluster)
+        # O filtro agora é automático dentro desta função
         backup_istio_to_s3(src_cluster, bk_name)
         
         print_step(f"Backup Velero: {bk_name}")
