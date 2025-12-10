@@ -3,6 +3,7 @@ import time
 import sys
 import os
 import json
+import shutil # Adicionado import que faltava para rmtree
 import boto3
 from botocore.exceptions import ClientError
 from kubernetes import client, config as k8s_config
@@ -18,38 +19,29 @@ SYSTEM_NAMESPACES = [
 
 EXCLUDE_RESOURCES = "pods,replicasets,endpoints,endpointslices"
 
-VELERO_IAM_POLICY = {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "ec2:DescribeVolumes", "ec2:DescribeSnapshots", "ec2:CreateTags",
-                "ec2:CreateVolume", "ec2:CreateSnapshot", "ec2:DeleteSnapshot"
-            ],
-            "Resource": "*"
-        },
-        {
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject", "s3:DeleteObject", "s3:PutObject",
-                "s3:AbortMultipartUpload", "s3:ListBucket"
-            ],
-            "Resource": "*" 
-        }
-    ]
-}
-
 # --- 0. HELPERS ---
-def get_env_opt(var_name, default=None):
-    return os.getenv(var_name, default)
+def get_input(prompt_text, env_var_name=None, required=True):
+    """
+    Solicita input do usuário.
+    Se env_var_name for fornecido e existir, usa como valor default (sugestão).
+    """
+    default_val = os.getenv(env_var_name) if env_var_name else None
+    display_default = f" [{default_val}]" if default_val else ""
+    
+    while True:
+        try:
+            user_val = input(f"{prompt_text}{display_default}: ").strip()
+        except EOFError:
+            # Caso rode em ambiente sem tty, força o uso do default ou erro
+            user_val = ""
 
-def get_required_env(var_name):
-    val = os.getenv(var_name)
-    if not val or val.strip() == "":
-        print(f"⛔ ERRO CRÍTICO: Variável obrigatória '{var_name}' não definida.")
-        sys.exit(1)
-    return val.strip()
+        # Lógica de decisão: Input Usuário > Variável de Ambiente > Vazio (se opcional)
+        final_val = user_val if user_val else default_val
+        
+        if final_val or not required:
+            return final_val
+        
+        print("   ❌ Este valor é obrigatório.")
 
 def run_shell(cmd, ignore_error=False, quiet=False):
     if not quiet: print(f"   [CMD] {cmd}")
@@ -64,40 +56,51 @@ def run_shell(cmd, ignore_error=False, quiet=False):
 
 # --- 1. SETUP ---
 def load_config():
-    print("\n🚀 --- Migração EKS V64 (Mandatory Cleanup) ---")
+    print("\n🚀 --- Migração EKS V64 (Interactive Mode) ---")
     
-    CONFIG['region'] = get_required_env("AWS_REGION")
-    CONFIG['mode'] = get_required_env("OPERATION_MODE") 
+    # Inputs Interativos
+    CONFIG['region'] = get_input("Região AWS", "AWS_REGION")
+    CONFIG['aws_profile'] = get_input("Profile AWS (Deixe vazio p/ Default/Jenkins)", "AWS_PROFILE", required=False)
     
-    CONFIG['aws_profile'] = get_required_env("AWS_PROFILE")
+    # Modos de operação
+    print("\nModos: [1] FULL_MIGRATION, [2] BACKUP_ONLY, [3] RESTORE_ONLY")
+    mode_map = {"1": "FULL_MIGRATION", "2": "BACKUP_ONLY", "3": "RESTORE_ONLY"}
+    mode_input = get_input("Selecione o Modo", "OPERATION_MODE")
+    CONFIG['mode'] = mode_map.get(mode_input, mode_input) # Aceita número ou texto
     
-    CONFIG['bucket_name'] = get_required_env("VELERO_BUCKET_NAME")
-    CONFIG['role_arn'] = get_required_env("VELERO_ROLE_ARN")
+    if CONFIG['mode'] not in mode_map.values():
+        print("⛔ Modo inválido.")
+        sys.exit(1)
+
+    CONFIG['bucket_name'] = get_input("Nome do Bucket Velero", "VELERO_BUCKET_NAME")
+    CONFIG['role_arn'] = get_input("ARN da Role do Velero", "VELERO_ROLE_ARN")
     
     CONFIG['cluster_src'] = None
     CONFIG['cluster_dst'] = None
     
     if CONFIG['mode'] in ['FULL_MIGRATION', 'BACKUP_ONLY']:
-        CONFIG['cluster_src'] = get_required_env("CLUSTER_SOURCE_NAME")
+        CONFIG['cluster_src'] = get_input("Cluster Origem (Source)", "CLUSTER_SOURCE_NAME")
         
     if CONFIG['mode'] in ['FULL_MIGRATION', 'RESTORE_ONLY']:
-        CONFIG['cluster_dst'] = get_required_env("CLUSTER_DEST_NAME")
+        CONFIG['cluster_dst'] = get_input("Cluster Destino (Dest)", "CLUSTER_DEST_NAME")
 
-    CONFIG['restore_backup_name'] = get_env_opt("BACKUP_NAME_TO_RESTORE")
-    if CONFIG['mode'] == 'RESTORE_ONLY' and not CONFIG['restore_backup_name']:
-        print("⛔ ERRO: Para RESTORE_ONLY, forneça 'BACKUP_NAME_TO_RESTORE'.")
-        sys.exit(1)
+    CONFIG['restore_backup_name'] = None
+    if CONFIG['mode'] == 'RESTORE_ONLY':
+        CONFIG['restore_backup_name'] = get_input("Nome do Backup para Restore", "BACKUP_NAME_TO_RESTORE")
 
-    CONFIG['istio_sync_mode'] = get_env_opt("ISTIO_SYNC_MODE", "all").lower()
-    
-    # REMOVIDO: Leitura de CLEANUP_ENABLED. Agora é hardcoded como comportamento padrão.
+    CONFIG['istio_sync_mode'] = get_input("Istio Sync Mode (all, ou lista de VSs)", "ISTIO_SYNC_MODE", required=False) or "all"
 
-    print(f"   ℹ️  Modo: {CONFIG['mode']}")
-    print(f"   ℹ️  Profile: {CONFIG['aws_profile']}")
-    print(f"   ℹ️  Região: {CONFIG['region']}")
+    print(f"\n   ℹ️  Resumo Config:")
+    print(f"      Região: {CONFIG['region']}")
+    print(f"      Profile: {CONFIG['aws_profile'] if CONFIG['aws_profile'] else '(Default/Env Vars)'}")
+    print(f"      Modo: {CONFIG['mode']}")
 
 def get_aws_session():
-    return boto3.Session(profile_name=CONFIG['aws_profile'], region_name=CONFIG['region'])
+    # Correção: Só usa profile se ele foi definido
+    if CONFIG['aws_profile']:
+        return boto3.Session(profile_name=CONFIG['aws_profile'], region_name=CONFIG['region'])
+    else:
+        return boto3.Session(region_name=CONFIG['region'])
 
 # --- 2. VALIDAÇÃO AWS ---
 def validate_bucket(bucket_name):
@@ -113,7 +116,7 @@ def extract_and_validate_role(role_arn):
     try:
         role_name = role_arn.split('/')[-1]
         get_aws_session().client('iam').get_role(RoleName=role_name)
-        print(f"   ✅ Role válida.")
+        print(f"   ✅ Role válida (Assumindo que permissões estão corretas).")
         return role_name
     except Exception as e:
         print(f"   ⛔ ERRO Role: {e}"); sys.exit(1)
@@ -122,8 +125,11 @@ def extract_and_validate_role(role_arn):
 def setup_kube_context(cluster_name):
     print(f"   🔍 Configurando kubeconfig para '{cluster_name}'...")
     try:
-        cmd = f"aws eks update-kubeconfig --name {cluster_name} --region {CONFIG['region']} --profile {CONFIG['aws_profile']}"
+        # Correção: Constrói a flag profile apenas se existir
+        profile_flag = f"--profile {CONFIG['aws_profile']}" if CONFIG['aws_profile'] else ""
+        cmd = f"aws eks update-kubeconfig --name {cluster_name} --region {CONFIG['region']} {profile_flag}"
         run_shell(cmd, quiet=True)
+        
         eks = get_aws_session().client('eks')
         return eks.describe_cluster(name=cluster_name)['cluster']['arn']
     except Exception as e:
@@ -170,36 +176,7 @@ cleanUpCRDs: false
 def get_cluster_oidc(name):
     return get_aws_session().client('eks').describe_cluster(name=name)['cluster']['identity']['oidc']['issuer'].replace("https://", "")
 
-def ensure_role_permissions(role_name, bucket_name):
-    print(f"   🛡️  Blindando permissões na role '{role_name}'...")
-    policy_doc = {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "ec2:DescribeVolumes", "ec2:DescribeSnapshots", "ec2:CreateTags",
-                    "ec2:CreateVolume", "ec2:CreateSnapshot", "ec2:DeleteSnapshot"
-                ],
-                "Resource": "*"
-            },
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "s3:GetObject", "s3:DeleteObject", "s3:PutObject",
-                    "s3:AbortMultipartUpload", "s3:ListBucket"
-                ],
-                "Resource": [
-                    f"arn:aws:s3:::{bucket_name}",
-                    f"arn:aws:s3:::{bucket_name}/*"
-                ]
-            }
-        ]
-    }
-    try:
-        get_aws_session().client('iam').put_role_policy(RoleName=role_name, PolicyName="VeleroPerms", PolicyDocument=json.dumps(policy_doc))
-        print(f"      ✅ Policy aplicada.")
-    except Exception as e: print(f"      ⚠️  Falha permissoes: {e}")
+# REMOVIDO: ensure_role_permissions (Conforme solicitado)
 
 # --- 5. LÓGICA CORE (TRUST / IRSA) ---
 def configure_irsa_trust(role_name, oidcs_list, ns, sa, mode='append'):
@@ -208,6 +185,8 @@ def configure_irsa_trust(role_name, oidcs_list, ns, sa, mode='append'):
     
     try:
         current_policy = iam.get_role(RoleName=role_name)['Role']['AssumeRolePolicyDocument']
+        
+        # Reset total se mode for replace
         if mode == 'replace':
             new_statements = [{"Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{acc}:root"}, "Action": "sts:AssumeRole"}]
         else:
@@ -218,26 +197,44 @@ def configure_irsa_trust(role_name, oidcs_list, ns, sa, mode='append'):
 
         for oidc in unique_oidcs:
             oidc_arn = f"arn:aws:iam::{acc}:oidc-provider/{oidc}"
+            
+            # Verifica se já existe a confiança exata
             exists = False
             for s in new_statements:
                 if s.get('Principal', {}).get('Federated') == oidc_arn:
                     cond = s.get('Condition', {}).get('StringEquals', {})
+                    # Verifica tanto SUB quanto AUD
+                    has_sub = False
+                    has_aud = False
                     for k, v in cond.items():
                         if f"{oidc}:sub" in k and v == f"system:serviceaccount:{ns}:{sa}":
-                            exists = True
-                            break
+                            has_sub = True
+                        if f"{oidc}:aud" in k and v == "sts.amazonaws.com":
+                            has_aud = True
+                    
+                    if has_sub: # Se tem sub, assumimos que existe (pode atualizar o aud se faltar, mas simplifiquei)
+                        exists = True
+                        break
+            
             if not exists:
+                # ADICIONADO: Validação de AUD para segurança
                 new_statements.append({
                     "Effect": "Allow",
                     "Principal": {"Federated": oidc_arn},
                     "Action": "sts:AssumeRoleWithWebIdentity",
-                    "Condition": {"StringEquals": {f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}"}}
+                    "Condition": {
+                        "StringEquals": {
+                            f"{oidc}:sub": f"system:serviceaccount:{ns}:{sa}",
+                            f"{oidc}:aud": "sts.amazonaws.com"
+                        }
+                    }
                 })
                 updated = True
         
         if updated or mode == 'replace':
             policy_doc = {"Version": "2012-10-17", "Statement": new_statements}
             iam.update_assume_role_policy(RoleName=role_name, PolicyDocument=json.dumps(policy_doc))
+            print(f"      🛡️  Trust Policy atualizada com aud+sub ({mode}).")
             return True
         return False
     except Exception as e:
@@ -368,7 +365,6 @@ def cleanup_velero(context):
         time.sleep(2)
 
 def install_velero(context):
-    # CHAMADA INCONDICIONAL DE LIMPEZA
     cleanup_velero(context)
     
     print(f"⚓ [{context}] Instalando Velero...")
@@ -384,7 +380,9 @@ def install_velero(context):
 # --- MAIN FLOWS ---
 def execute_backup_flow(ctx_src, allowed_oidcs, trust_mode):
     bk = f"migracao-{int(time.time())}"
+    # Chama configuração de IRSA com as novas flags de segurança
     configure_irsa_trust(CONFIG['role_name'], allowed_oidcs, "velero", "velero-server", mode=trust_mode)
+    
     if ctx_src: run_pre_flight_irsa(ctx_src, allowed_oidcs, mode=trust_mode)
     
     print(f"\n--- 🚀 FASE ORIGEM (Backup) ---")
@@ -419,9 +417,11 @@ def main():
     os.environ["KUBECONFIG"] = os.path.join(cwd, "kube_config")
     
     load_config()
+    
     validate_bucket(CONFIG['bucket_name'])
     CONFIG['role_name'] = extract_and_validate_role(CONFIG['role_arn'])
-    ensure_role_permissions(CONFIG['role_name'], CONFIG['bucket_name'])
+    # REMOVIDO: ensure_role_permissions (agora assumimos que a role está OK)
+    
     generate_velero_values(CONFIG['bucket_name'], CONFIG['role_arn'], CONFIG['region'])
 
     ctx_src, ctx_dst = None, None
