@@ -12,6 +12,7 @@ from kubernetes import client, config as k8s_config
 GLOBAL_SESSION = None
 CONFIG = {}
 
+# Namespaces de sistema (Ignorados no scan/backup)
 SYSTEM_NAMESPACES = [
     "default", "kube-system", "kube-public", "kube-node-lease", 
     "velero", "amazon-cloudwatch", "aws-observability", "istio-system", "istio-ingress", "cert-manager", "monitoring",
@@ -219,19 +220,27 @@ def install_velero(context):
     if not run_shell(f"kubectl config use-context {context}", quiet=True):
         print_error(f"Erro ao mudar contexto para {context}."); sys.exit(1)
 
-    # 1. REMOÇÃO LIMPA E SÍNCRONA
+    # 1. REMOÇÃO AGRESSIVA E LIMPA
     print_info("Limpando instalação anterior...")
     run_shell("helm uninstall velero -n velero", ignore_error=True)
     
-    # Loop de espera para deleção real do namespace
-    run_shell("kubectl delete ns velero --timeout=60s", ignore_error=True)
-    for i in range(30):
+    # Inicia deleção
+    run_shell("kubectl delete ns velero --timeout=5s --wait=false", ignore_error=True)
+    
+    # Monitora a morte do namespace
+    print_info("Aguardando namespace 'velero' terminar...")
+    for i in range(20): # Loop de verificação
+        # Se get ns retornar erro, é porque já sumiu (Sucesso)
         if subprocess.run("kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
             break
-        if i == 5: # Se demorar, força limpeza
-             run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True)
+        
+        # Se passar de 10 segundos (5 * 2s), força a remoção
+        if i >= 5: 
+            sys.stdout.write(" [Forçando Finalizers] ")
+            sys.stdout.flush()
+            run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True)
+        
         time.sleep(2)
-        print_info("Aguardando namespace terminar...")
 
     # 2. INSTALAÇÃO
     print_info("Criando namespace e instalando...")
@@ -241,11 +250,13 @@ def install_velero(context):
     cmd = "helm upgrade --install velero vmware-tanzu/velero --namespace velero -f values.yaml --reset-values --wait --timeout 5m"
     
     if not run_shell(cmd):
-        print_error("Helm falhou. Abortando."); sys.exit(1)
+        print_error("Helm falhou. Tentando limpeza forçada..."); 
+        # Última tentativa de force clean se o helm falhar
+        run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True)
+        sys.exit(1)
 
     # 3. VERIFICAÇÃO REAL (Running check)
     print_info("Verificando status do Pod...")
-    # Espera até o pod estar realmente running
     if not run_shell("kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=velero -n velero --timeout=90s"):
          print_error("Pod do Velero não ficou pronto a tempo."); sys.exit(1)
          
@@ -304,7 +315,7 @@ def restore_istio(dst, bk_name):
 # --- MAIN ---
 def main():
     global GLOBAL_SESSION
-    print("\n🚀 --- Migração EKS V68 (Robust Install) ---")
+    print("\n🚀 --- Migração EKS V69 (Wait Sync + Force Delete) ---")
 
     s, p = select_aws_profile()
     CONFIG['aws_profile'] = p
@@ -336,20 +347,35 @@ def main():
         backup_istio(src, bk)
         
         print_step(f"Criando Backup: {bk}")
-        # Garante contexto antes do backup command
         run_shell(f"kubectl config use-context {src}", quiet=True)
         if not run_shell(f"velero backup create {bk} --exclude-namespaces {','.join(SYSTEM_NAMESPACES)} --exclude-resources {EXCLUDE_RESOURCES} --wait"):
             sys.exit(1)
 
     if mode in ['FULL_MIGRATION', 'RESTORE_ONLY']:
         install_velero(dst)
-        print_step(f"Aguardando Sync Backup: {bk}")
-        # Loop de verificação BSL
-        for i in range(60):
-             if run_shell(f"velero backup describe {bk}", quiet=True): break
+        
+        # --- AQUI: Espera de Propagação S3 ---
+        print_step(f"Sincronizando Backup: {bk}")
+        print_info("Aguardando 60s para propagação do S3...")
+        time.sleep(60) # Espera inicial
+        
+        # Loop silencioso
+        sys.stdout.write("   Procurando backup no cluster: ")
+        found = False
+        for i in range(30):
+             # check=False para não dar erro se falhar, stdout null para silenciar
+             res = subprocess.run(f"velero backup describe {bk}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+             if res.returncode == 0:
+                 found = True; break
+             sys.stdout.write("."); sys.stdout.flush()
              time.sleep(5)
-             if i == 59: print_error("Backup não sincronizou."); sys.exit(1)
-             
+        
+        if not found:
+            print("\n")
+            print_error("Timeout: O backup não apareceu no cluster destino após a espera.")
+            sys.exit(1)
+        
+        print(" OK!")     
         print_step("Restaurando...")
         run_shell(f"velero restore create --from-backup {bk} --existing-resource-policy update --exclude-resources {EXCLUDE_RESOURCES} --wait")
         restore_istio(dst, bk)
