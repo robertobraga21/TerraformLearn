@@ -12,7 +12,22 @@ from kubernetes import client, config as k8s_config
 GLOBAL_SESSION = None
 CONFIG = {}
 
-# Namespaces de sistema (Ignorados no scan/backup)
+# Estrutura para acumular dados do relatório final
+REPORT = {
+    "source_cluster": "N/A",
+    "dest_cluster": "N/A",
+    "backup_name": "N/A",
+    "backup_status": "N/A",  # Completed, PartiallyFailed, Failed
+    "restore_status": "N/A",
+    "istio_exported_count": 0,
+    "istio_exported_names": [],
+    "istio_imported_count": 0,
+    "istio_imported_names": [],
+    "irsa_apps_found": 0,
+    "irsa_apps_missing": 0,
+    "start_time": time.strftime("%H:%M:%S")
+}
+
 SYSTEM_NAMESPACES = [
     "default", "kube-system", "kube-public", "kube-node-lease", 
     "velero", "amazon-cloudwatch", "aws-observability", "istio-system", "istio-ingress", "cert-manager", "monitoring",
@@ -38,6 +53,17 @@ def run_shell(cmd, ignore_error=False, quiet=True):
             err_msg = e.stderr.decode().strip() if e.stderr else "Erro desconhecido"
             print_error(f"Falha no comando shell: {err_msg}")
         return False
+
+# --- HELPER DE STATUS VELERO ---
+def get_velero_status(resource_type, name):
+    """Lê o status JSON real do Velero (Backup ou Restore)"""
+    try:
+        cmd = f"kubectl get {resource_type} {name} -n velero -o json"
+        res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+        data = json.loads(res.stdout)
+        return data.get('status', {}).get('phase', 'Unknown')
+    except:
+        return "CheckFailed"
 
 # --- AWS AUTH ---
 def select_aws_profile():
@@ -135,10 +161,13 @@ def scan_applications_irsa(cluster_name):
         
         found += 1
         arn = (sa.metadata.annotations or {}).get('eks.amazonaws.com/role-arn')
-        if arn: print(f"   ✅ [{ns}] {name} -> {arn.split('/')[-1]}")
+        if arn: 
+            print(f"   ✅ [{ns}] {name} -> {arn.split('/')[-1]}")
+            REPORT['irsa_apps_found'] += 1
         else:
             print(f"   ⚠️  [{ns}] {name} -> SEM ROLE!")
             missing += 1
+            REPORT['irsa_apps_missing'] += 1
 
     print("-" * 30)
     if missing > 0:
@@ -220,29 +249,22 @@ def install_velero(context):
     if not run_shell(f"kubectl config use-context {context}", quiet=True):
         print_error(f"Erro ao mudar contexto para {context}."); sys.exit(1)
 
-    # 1. REMOÇÃO AGRESSIVA E LIMPA
     print_info("Limpando instalação anterior...")
     run_shell("helm uninstall velero -n velero", ignore_error=True)
     
-    # Inicia deleção
     run_shell("kubectl delete ns velero --timeout=5s --wait=false", ignore_error=True)
     
-    # Monitora a morte do namespace
     print_info("Aguardando namespace 'velero' terminar...")
-    for i in range(20): # Loop de verificação
-        # Se get ns retornar erro, é porque já sumiu (Sucesso)
+    for i in range(20): 
         if subprocess.run("kubectl get ns velero", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
             break
         
-        # Se passar de 10 segundos (5 * 2s), força a remoção
         if i >= 5: 
             sys.stdout.write(" [Forçando Finalizers] ")
             sys.stdout.flush()
             run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True)
-        
         time.sleep(2)
 
-    # 2. INSTALAÇÃO
     print_info("Criando namespace e instalando...")
     if not run_shell("kubectl create ns velero"): print_error("Falha create ns"); sys.exit(1)
     
@@ -251,11 +273,9 @@ def install_velero(context):
     
     if not run_shell(cmd):
         print_error("Helm falhou. Tentando limpeza forçada..."); 
-        # Última tentativa de force clean se o helm falhar
         run_shell(f"kubectl get namespace velero -o json | tr -d \"\\n\" | sed \"s/\\\"finalizers\\\": \\[[^]]*\\]/\\\"finalizers\\\": []/\" | kubectl replace --raw /api/v1/namespaces/velero/finalize -f -", ignore_error=True)
         sys.exit(1)
 
-    # 3. VERIFICAÇÃO REAL (Running check)
     print_info("Verificando status do Pod...")
     if not run_shell("kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=velero -n velero --timeout=90s"):
          print_error("Pod do Velero não ficou pronto a tempo."); sys.exit(1)
@@ -284,8 +304,10 @@ def backup_istio(src, bk_name):
             GLOBAL_SESSION.client('s3').upload_file(path, CONFIG['bucket_name'], f"istio-artifacts/{bk_name}/{name}.json")
             print(f"   📤 Salvo: {name}")
             cnt += 1
+            REPORT['istio_exported_names'].append(name)
         else: skp += 1
-            
+    
+    REPORT['istio_exported_count'] = cnt
     shutil.rmtree(tmp)
     print_success(f"Istio: {cnt} salvos, {skp} ignorados.")
 
@@ -304,18 +326,55 @@ def restore_istio(dst, bk_name):
             try:
                 api.create_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices", data)
                 print(f"   ➕ Criado: {name}")
+                REPORT['istio_imported_count'] += 1
+                REPORT['istio_imported_names'].append(name)
             except client.exceptions.ApiException as e:
                 if e.status == 409:
                     curr = api.get_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices", name)
                     data['metadata']['resourceVersion'] = curr['metadata']['resourceVersion']
                     api.replace_namespaced_custom_object("networking.istio.io", "v1beta1", "istio-system", "virtualservices", name, data)
                     print(f"   🔄 Atualizado: {name}")
+                    REPORT['istio_imported_count'] += 1
+                    REPORT['istio_imported_names'].append(f"{name} (Updated)")
     except Exception as e: print_error(f"Erro Restore Istio: {e}")
+
+# --- REPORT FINAL ---
+def print_final_report():
+    print("\n" + "="*50)
+    print("           RELATÓRIO DE EXECUÇÃO")
+    print("="*50)
+    print(f"🕒 Início: {REPORT['start_time']} | Fim: {time.strftime('%H:%M:%S')}")
+    print(f"📂 Backup Name: {REPORT['backup_name']}")
+    
+    print("\n🌍 Clusters:")
+    print(f"   Origem:  {REPORT['source_cluster']}")
+    print(f"   Destino: {REPORT['dest_cluster']}")
+
+    print("\n💾 Status do Velero:")
+    
+    # Formatação condicional de status
+    bk_st = REPORT['backup_status']
+    bk_emoji = "✅" if bk_st == "Completed" else "⚠️" if bk_st == "PartiallyFailed" else "❌" if bk_st != "N/A" else "⚪"
+    print(f"   Backup:  {bk_emoji} {bk_st}")
+
+    rst_st = REPORT['restore_status']
+    rst_emoji = "✅" if rst_st == "Completed" else "⚠️" if rst_st == "PartiallyFailed" else "❌" if rst_st != "N/A" else "⚪"
+    print(f"   Restore: {rst_emoji} {rst_st}")
+
+    print("\n🕸️  Istio (VirtualServices):")
+    print(f"   Exportados: {REPORT['istio_exported_count']} ({', '.join(REPORT['istio_exported_names'][:3])}{'...' if len(REPORT['istio_exported_names'])>3 else ''})")
+    print(f"   Importados: {REPORT['istio_imported_count']} ({', '.join(REPORT['istio_imported_names'][:3])}{'...' if len(REPORT['istio_imported_names'])>3 else ''})")
+
+    print("\n🛡️  Segurança (IRSA Roles):")
+    print(f"   Encontradas: {REPORT['irsa_apps_found']}")
+    print(f"   Ausentes:    {REPORT['irsa_apps_missing']}")
+    
+    print("\n" + "="*50)
 
 # --- MAIN ---
 def main():
     global GLOBAL_SESSION
-    print("\n🚀 --- Migração EKS V69 (Wait Sync + Force Delete) ---")
+    print("\n🚀 --- Migração EKS V70 (Final Report + Status Check) ---")
 
     s, p = select_aws_profile()
     CONFIG['aws_profile'] = p
@@ -330,10 +389,15 @@ def main():
     mode = 'FULL_MIGRATION' if m == '1' else 'BACKUP_ONLY' if m == '2' else 'RESTORE_ONLY'
 
     src, dst = None, None
-    if mode in ['FULL_MIGRATION', 'BACKUP_ONLY']: src = get_valid_input("Cluster Origem", check_cluster_wrapper, GLOBAL_SESSION)
-    if mode in ['FULL_MIGRATION', 'RESTORE_ONLY']: dst = get_valid_input("Cluster Destino", check_cluster_wrapper, GLOBAL_SESSION)
+    if mode in ['FULL_MIGRATION', 'BACKUP_ONLY']: 
+        src = get_valid_input("Cluster Origem", check_cluster_wrapper, GLOBAL_SESSION)
+        REPORT['source_cluster'] = src
+    if mode in ['FULL_MIGRATION', 'RESTORE_ONLY']: 
+        dst = get_valid_input("Cluster Destino", check_cluster_wrapper, GLOBAL_SESSION)
+        REPORT['dest_cluster'] = dst
     
     bk = input("   Nome Backup: ").strip() if mode == 'RESTORE_ONLY' else f"migracao-{int(time.time())}"
+    REPORT['backup_name'] = bk
 
     # Execution
     oidcs = []
@@ -348,22 +412,24 @@ def main():
         
         print_step(f"Criando Backup: {bk}")
         run_shell(f"kubectl config use-context {src}", quiet=True)
+        # Executa o backup
         if not run_shell(f"velero backup create {bk} --exclude-namespaces {','.join(SYSTEM_NAMESPACES)} --exclude-resources {EXCLUDE_RESOURCES} --wait"):
             sys.exit(1)
+        
+        # --- CAPTURA STATUS REAL DO BACKUP ---
+        REPORT['backup_status'] = get_velero_status("backup", bk)
+        print_info(f"Status Final do Backup: {REPORT['backup_status']}")
 
     if mode in ['FULL_MIGRATION', 'RESTORE_ONLY']:
         install_velero(dst)
         
-        # --- AQUI: Espera de Propagação S3 ---
         print_step(f"Sincronizando Backup: {bk}")
         print_info("Aguardando 60s para propagação do S3...")
-        time.sleep(60) # Espera inicial
+        time.sleep(60) 
         
-        # Loop silencioso
         sys.stdout.write("   Procurando backup no cluster: ")
         found = False
         for i in range(30):
-             # check=False para não dar erro se falhar, stdout null para silenciar
              res = subprocess.run(f"velero backup describe {bk}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
              if res.returncode == 0:
                  found = True; break
@@ -371,16 +437,28 @@ def main():
              time.sleep(5)
         
         if not found:
-            print("\n")
-            print_error("Timeout: O backup não apareceu no cluster destino após a espera.")
+            print_error("Timeout: Backup não encontrado.")
             sys.exit(1)
         
         print(" OK!")     
         print_step("Restaurando...")
         run_shell(f"velero restore create --from-backup {bk} --existing-resource-policy update --exclude-resources {EXCLUDE_RESOURCES} --wait")
+        
+        # --- CAPTURA STATUS REAL DO RESTORE ---
+        # O nome do restore automático criado pelo velero geralmente é restauracao-<uuid> ou nome-do-backup-<timestamp>
+        # Mas quando rodamos 'velero restore create --from-backup X', o nome do restore geralmente é 'X-<timestamp>'
+        # Para pegar o status corretamente, pegamos o restore mais recente
+        restore_name_cmd = "kubectl get restore -n velero --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}'"
+        try:
+            restore_name = subprocess.check_output(restore_name_cmd, shell=True).decode().strip()
+            REPORT['restore_status'] = get_velero_status("restore", restore_name)
+        except:
+            REPORT['restore_status'] = "Unknown"
+
         restore_istio(dst, bk)
 
-    print("\n✅ Finalizado com sucesso.")
+    # IMPRIME RELATÓRIO FINAL
+    print_final_report()
 
 if __name__ == "__main__":
     try: main()
